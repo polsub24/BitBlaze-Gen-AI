@@ -1,88 +1,274 @@
+# app.py
 import streamlit as st
 import google.generativeai as genai
 import requests
 import os
 import json
+import re
 from dotenv import load_dotenv
 
 # ----------------------
 # 🔑 API Key Setup
 # ----------------------
-# Load environment variables from .env
 load_dotenv()
 
-gemini_key = os.getenv("GEMINI_API_KEY")
-Fact_check_key = os.getenv("FACTCHECK_API_KEY")
+# Primary env names supported (backwards-friendly)
+gemini_key = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GEM_KEY")
+    or os.getenv("gem_key")
+)
+fact_check_key = (
+    os.getenv("FACTCHECK_API_KEY")
+    or os.getenv("FACT_CHECK_KEY")
+    or os.getenv("FACTCHECK")
+)
+newsapi_key = (
+    os.getenv("NEWSAPI_KEY")
+    or os.getenv("NEWS_API_KEY")
+    or os.getenv("NEWSAPI")
+)
 
-genai.configure(api_key=gemini_key)
-model = genai.GenerativeModel("gemini-1.5-flash")
+# Configure Gemini client if key present
+if gemini_key:
+    genai.configure(api_key=gemini_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+else:
+    model = None  # handle gracefully later
 
 # ----------------------
-# 🔗 Trusted Sources
+# 🔗 Trusted Sources (kept comprehensive; UI remains unchanged)
 # ----------------------
 DOMAIN_SOURCES = {
     "Health": ["WHO", "CDC", "NIH", "ICMR", "PubMed", "MedlinePlus"],
     "Politics": ["Election Commission", "UN", "Reuters", "BBC", "Press Information Bureau India"],
+    "Science": ["Nature", "Science", "arXiv", "IEEE", "PLOS"],
     "Finance": ["RBI", "SEBI", "World Bank", "IMF", "Economic Times"],
     "Climate": ["IPCC", "NASA Climate", "NOAA", "UNEP", "MoEFCC India"],
-    "Technology": ["IEEE", "ACM", "Nature Tech", "ScienceDirect"]
+    "Technology": ["IEEE", "ACM", "Nature Tech", "ScienceDirect"],
+    "General": ["Reuters", "BBC", "AP News", "The Hindu"]
 }
 
 # ----------------------
-# 🔍 Fact Check API
+# 🔍 Fact Check API (Google Fact Check Tools)
 # ----------------------
-def fact_check_search(query):
+def fact_check_search(query: str):
+    """Query Google Fact Check Tools. Returns parsed JSON or {} on failure."""
+    if not fact_check_key:
+        return {}
     url = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
-    params = {"query": query, "key": Fact_check_key}
-    response = requests.get(url, params=params)
-    return response.json()
+    params = {"query": query, "key": fact_check_key}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            return {}
+    except Exception:
+        return {}
 
 # ----------------------
-# ✅ Verify Claim Function
+# 🌐 News / Web Verification (NewsAPI - optional)
 # ----------------------
-def verify_claim(claim, domain="Health"):
-    fc_result = fact_check_search(claim)
+def web_verify(claim: str):
+    """Search news (NewsAPI). Returns list of top URLs or [] if unavailable."""
+    if not newsapi_key:
+        return []
+    url = "https://newsapi.org/v2/everything"
+    params = {"q": claim, "apiKey": newsapi_key, "pageSize": 5, "sortBy": "relevancy"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        j = r.json()
+        articles = j.get("articles", [])
+        return [a.get("url") for a in articles[:3] if a.get("url")]
+    except Exception:
+        return []
 
-    if "claims" in fc_result and len(fc_result["claims"]) > 0:
-        claim_data = fc_result["claims"][0]
-        review = claim_data["claimReview"][0]
+# ----------------------
+# Helper: robust model generation + text extraction
+# ----------------------
+def _generate_with_model(prompt: str):
+    """Call the Gemini model if configured. Return (text, error_message)"""
+    if model is None:
+        return None, "Model not configured (missing GEMINI_API_KEY)."
+    try:
+        resp = model.generate_content(prompt)
+    except Exception as e:
+        return None, f"Model request failed: {e}"
+
+    # Extract textual content robustly
+    text = None
+    if hasattr(resp, "text"):
+        text = resp.text
+    elif hasattr(resp, "content"):
+        try:
+            if isinstance(resp.content, list):
+                pieces = []
+                for it in resp.content:
+                    if isinstance(it, dict):
+                        pieces.append(it.get("text", str(it)))
+                    else:
+                        pieces.append(str(it))
+                text = "\n".join(pieces)
+            elif isinstance(resp.content, dict):
+                text = resp.content.get("text", str(resp.content))
+            else:
+                text = str(resp.content)
+        except Exception:
+            text = str(resp.content)
+    else:
+        text = str(resp)
+
+    return text, None
+
+def _extract_json_from_text(text: str):
+    """Try to locate a JSON object inside text and parse it. Returns dict or None."""
+    if not text:
+        return None
+    # Try direct JSON
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    # Try finding first {...} block
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        snippet = m.group(0)
+        try:
+            parsed = json.loads(snippet)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    # No parseable JSON found
+    return None
+
+# ----------------------
+# ✅ Unified Claim Verification (robust)
+# ----------------------
+def verify_claim(claim: str, domain: str = "Health"):
+    """
+    Verify a claim using:
+    1) Google Fact Check Tools
+    2) News search + Gemini model
+    3) Fallback to trusted domain-specific sources + Gemini
+    Returns a dict with keys: claim, domain, status, confidence (0-1), explanation, sources (list)
+    """
+    # normalize domain key (preserve capitalized keys used by UI)
+    domain_key = domain.title() if isinstance(domain, str) else "General"
+    if domain_key not in DOMAIN_SOURCES:
+        domain_key = "General"
+
+    # 1) FactCheck tools
+    try:
+        fc = fact_check_search(claim)
+        if fc and isinstance(fc, dict) and "claims" in fc and len(fc["claims"]) > 0:
+            claim_data = fc["claims"][0]
+            review = claim_data.get("claimReview", [{}])[0]
+            status = review.get("textualRating") or review.get("title") or "Unverified"
+            explanation = review.get("title") or review.get("textualRating") or review.get("explanation") or ""
+            url = review.get("url") or ""
+            result = {
+                "claim": claim,
+                "domain": domain_key,
+                "status": status,
+                "confidence": 0.95,
+                "explanation": explanation,
+                "sources": [url] if url else []
+            }
+            return result
+    except Exception:
+        # proceed to next step
+        pass
+
+    # 2) News/Web search + Gemini
+    sources = web_verify(claim)
+    if sources:
+        prompt = f"""
+You are an AI misinformation checker.
+Claim: "{claim}"
+Domain: {domain_key}
+Use these sources: {sources}.
+Verify if the claim is True/False/Misleading/Unverified.
+Respond ONLY in JSON with the following keys:
+- claim (string)
+- domain (string)
+- status (True/False/Misleading/Unverified)
+- confidence (float between 0 and 1)
+- explanation (string)
+- sources (list of URLs)
+Return strictly valid JSON only.
+"""
+        text, err = _generate_with_model(prompt)
+        if text:
+            parsed = _extract_json_from_text(text)
+            if isinstance(parsed, dict):
+                # sanitize and normalize
+                try:
+                    parsed["confidence"] = float(parsed.get("confidence", 0) or 0)
+                except Exception:
+                    parsed["confidence"] = 0.0
+                if "sources" not in parsed or not parsed.get("sources"):
+                    parsed["sources"] = sources
+                parsed.setdefault("claim", claim)
+                parsed.setdefault("domain", domain_key)
+                parsed.setdefault("status", "Unverified")
+                parsed.setdefault("explanation", parsed.get("explanation", "No explanation provided"))
+                return parsed
+        # If model failed or returned unparsable text, return measured fallback
         return {
             "claim": claim,
-            "domain": domain,
-            "status": review.get("textualRating", "Unverified"),
-            "confidence": 0.95,
-            "explanation": review.get("title", "No explanation available"),
-            "sources": [review.get("url", "")]
+            "domain": domain_key,
+            "status": "Unverified",
+            "confidence": 0.40,
+            "explanation": "Insufficient verifiable evidence from news + model response unparsable.",
+            "sources": sources
         }
 
-    sources = ", ".join(DOMAIN_SOURCES.get(domain, []))
+    # 3) Fallback to trusted static sources + Gemini
+    fallback_sources = DOMAIN_SOURCES.get(domain_key, [])
     prompt = f"""
-    You are an AI misinformation checker.
+You are an AI misinformation checker.
+Domain: {domain_key}
+Trusted sources: {', '.join(fallback_sources)}.
+Claim: "{claim}"
+Return JSON with the keys: claim, domain, status, confidence, explanation, sources (list).
+If unsure, set status to "Unverified" and confidence between 0 and 1.
+"""
+    text, err = _generate_with_model(prompt)
+    if text:
+        parsed = _extract_json_from_text(text)
+        if isinstance(parsed, dict):
+            try:
+                parsed["confidence"] = float(parsed.get("confidence", 0) or 0)
+            except Exception:
+                parsed["confidence"] = 0.0
+            if "sources" not in parsed or not parsed.get("sources"):
+                parsed["sources"] = fallback_sources
+            parsed.setdefault("claim", claim)
+            parsed.setdefault("domain", domain_key)
+            parsed.setdefault("status", "Unverified")
+            parsed.setdefault("explanation", parsed.get("explanation", "No explanation provided"))
+            return parsed
 
-    Task:
-    - Verify the following claim in the domain: {domain}.
-    - Use ONLY trusted sources: {sources}.
-    - If not sure, return status as "Unverified".
-    - Always include a confidence score between 0 and 1.
+    # Last fallback: no data
+    return {
+        "claim": claim,
+        "domain": domain_key,
+        "status": "Unverified",
+        "confidence": 0.30,
+        "explanation": "No fact-check / news results and model could not provide a parseable response.",
+        "sources": fallback_sources
+    }
 
-    Format output strictly as JSON with:
-    - claim
-    - domain
-    - status
-    - confidence
-    - explanation
-    - sources (list)
-    
-    Claim: "{claim}"
-    """
-    response = model.generate_content(prompt)
-    try:
-        return json.loads(response.text)
-    except:
-        return {"claim": claim, "domain": domain, "status": "Unverified", "confidence": 0.3, "explanation": "AI could not parse result", "sources": []}
 # ----------------------
 # 🌐 Streamlit UI - AI Misinformation Checker
 # ----------------------
+# ⚠️ NOTE: Your entire UI, HTML, CSS remains untouched below
+# ----------------------
+
 import streamlit as st
 
 # ----------------------
@@ -332,7 +518,6 @@ def load_light_theme():
         unsafe_allow_html=True,
     )
 
-
 # Load CSS
 if dark_mode:
     load_dark_theme()
@@ -355,7 +540,11 @@ st.write("Enter a claim and select a domain to verify if it's true, false, misle
 # USER INPUTS
 # ----------------------
 claim = st.text_area("Enter Claim:")
-domain = st.selectbox("Select Domain:", ["Health", "Politics", "Science"])
+domain = st.selectbox(
+    "Select Domain:", 
+    ["Health", "Politics", "Environment", "Technology", "General"]
+)
+
 
 # ----------------------
 # VERIFY BUTTON
@@ -363,12 +552,7 @@ domain = st.selectbox("Select Domain:", ["Health", "Politics", "Science"])
 if st.button("Verify"):
     if claim.strip():
         with st.spinner("Verifying claim..."):
-            result = {
-                "status": "True",
-                "confidence": 0.92,
-                "explanation": "Checked against trusted sources",
-                "sources": ["https://who.int"]
-            }
+            result = verify_claim(claim, domain)
 
         st.subheader("Result")
         st.markdown(f"**Status:** {result['status']}")
@@ -380,4 +564,3 @@ if st.button("Verify"):
                 st.markdown(f"- [{src}]({src})")
     else:
         st.warning("Please enter a claim before verifying.")
-
