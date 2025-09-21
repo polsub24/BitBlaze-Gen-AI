@@ -348,8 +348,8 @@ if st.session_state.show_theme_box:
         </style>
         <div class="theme-prompt">
             <form action="" method="get">
-                <button class="theme-btn dark-btn" type="submit" name="theme" value="Dark">🌙 Dark Mode</button>
-                <button class="theme-btn light-btn" type="submit" name="theme" value="Light">☀️ Light Mode</button>
+                <button class="theme-btn dark-btn" type="submit" name="theme" value="Dark">🌙Dark Mode</button>
+                <button class="theme-btn light-btn" type="submit" name="theme" value="Light">☀️Light Mode</button>
             </form>
         </div>
         """,
