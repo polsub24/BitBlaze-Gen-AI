@@ -2,3 +2,4 @@ streamlit
 google-generativeai
 requests
 python-dotenv
+ipywidgets
