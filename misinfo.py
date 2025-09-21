@@ -50,7 +50,18 @@ def fact_check_search(query):
     response = requests.get(url, params=params)
     return response.json()
 
-#main verification function
+def web_verify(claim):
+    """
+    Simple web/news search for latest claims.
+    Replace with NewsAPI, Bing, Tavily, or Google Custom Search.
+    """
+    url = f"https://newsapi.org/v2/everything?q={claim}&apiKey=dd2086b5b36d493dacccc8cb462a8712"
+    response = requests.get(url).json()
+    articles = response.get("articles", [])
+    top_sources = [a["url"] for a in articles[:3]]  # take top 3 URLs
+    return top_sources
+
+#main_verification function
 
 def verify_claim(claim, domain="health"):
     """
@@ -58,7 +69,7 @@ def verify_claim(claim, domain="health"):
     Domains: health, politics, finance, climate
     """
 
-    #Try Fact Check API
+    #try fact check API
     fc_result = fact_check_search(claim)
     if "claims" in fc_result and len(fc_result["claims"]) > 0:
         claim_data = fc_result["claims"][0]
@@ -68,19 +79,42 @@ def verify_claim(claim, domain="health"):
             "claim": claim,
             "domain": domain,
             "status": review.get("textualRating", "Unverified"),
-            "confidence": 0.95,   #High confidence if fact-check source is found
+            "confidence": 0.95,   # High confidence if fact-check source is found
             "explanation": review.get("title", "No explanation available"),
             "sources": [review.get("url", "")]
         }
 
+    # 2.try Web/News Verification
+    sources = web_verify(claim)
+    if sources:
+        prompt = f"""
+        You are an AI misinformation checker.
 
-    sources = ", ".join(DOMAIN_SOURCES.get(domain, []))
+        Claim: "{claim}"
+        Domain: {domain}
+
+        Use these live sources: {sources}.
+        Verify if the claim is True/False/Misleading/Unverified.
+        Always respond in JSON with:
+        - claim
+        - domain
+        - status
+        - confidence (0 to 1)
+        - explanation
+        - sources (2-3 trusted URLs)
+        """
+
+        response = model.generate_content(prompt)
+        return response.text
+
+    #use static trusted sources list
+    fallback_sources = ", ".join(DOMAIN_SOURCES.get(domain, []))
     prompt = f"""
     You are an AI misinformation checker.
 
     Task:
     - Verify the following claim in the domain: {domain}.
-    - Use ONLY trusted sources: {sources}.
+    - Use ONLY trusted sources: {fallback_sources}.
     - If not sure, return status as "Unverified".
     - Always include a confidence score between 0 and 1.
 
@@ -100,9 +134,9 @@ def verify_claim(claim, domain="health"):
 
 #testing examples
 print(verify_claim("Drinking Hot water cures Covid", "Health"))
-print(verify_claim("5G towers cause COVID-19", "Technology"))
+print(verify_claim("5G is better than 4G network", "Technology"))
 print(verify_claim("The Paris Agreement is a legally binding treaty on climate change", "Environment"))
-print(verify_claim("Rekha Gupta is the new CM of Delhi", "Politics"))
+print(verify_claim("Charlie Kirk is dead", "Politics"))
 
 
 
@@ -127,3 +161,4 @@ selected_domain = domain_dropdown.value  # gets whatever is selected
 result = verify_claim(test_claim, selected_domain)
 print(result)
 
+#main verification function def verify_claim(claim, domain="health"): """ Verify misinformation claim in given domain. Domains: health, politics, finance, climate """ #Try Fact Check API fc_result = fact_check_search(claim) if "claims" in fc_result and len(fc_result["claims"]) > 0: claim_data = fc_result["claims"][0] review = claim_data["claimReview"][0] return { "claim": claim, "domain": domain, "status": review.get("textualRating", "Unverified"), "confidence": 0.95, #High confidence if fact-check source is found "explanation": review.get("title", "No explanation available"), "sources": [review.get("url", "")] } sources = ", ".join(DOMAIN_SOURCES.get(domain, [])) prompt = f""" You are an AI misinformation checker. Task: - Verify the following claim in the domain: {domain}. - Use ONLY trusted sources: {sources}. - If not sure, return status as "Unverified". - Always include a confidence score between 0 and 1. Format output strictly as JSON with: - claim (string) - domain (string) - status (True/False/Misleading/Unverified) - confidence (float between 0 and 1) - explanation (short, human-readable) - sources (list of 2-3 trusted URLs) Claim: "{claim}" """ response = model.generate_content(prompt) return response.text
